@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Calibration output (user-generated, not source)
+calibration.json
+calibration.npz
+calibration_verification.jpg
+bkup/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

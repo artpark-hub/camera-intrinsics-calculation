@@ -1,0 +1,19 @@
+[project]
+name = "mdct-proto"
+version = "0.3.0"
+description = "Dynamic Calibration Target for RTSP camera intrinsic calibration"
+requires-python = ">=3.12"
+dependencies = [
+    "opencv-contrib-python>=4.8.0",
+    "numpy>=1.24.0",
+    "flask>=3.0.0",
+]
+
+[project.optional-dependencies]
+# macOS auto-detection of screen physical dimensions (local-display mode only)
+macos = [
+    "pyobjc-framework-quartz>=12.1",
+]
+
+[project.scripts]
+mdct = "main:main"
