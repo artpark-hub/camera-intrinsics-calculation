@@ -11,14 +11,32 @@ import numpy as np
 from pathlib import Path
 
 
-def export_intrinsics_json(output_path, K, dist, rms, frame_size):
+def export_intrinsics_json(
+    output_path,
+    K,
+    dist,
+    rms,
+    frame_size,
+    health=None,
+    quality_distribution=None,
+    confidence=None,
+):
     """
     Export camera intrinsics to a JSON file.
 
-    K        : (3,3) intrinsic matrix
-    dist     : (1,5) distortion coefficients
-    rms      : float reprojection error
-    frame_size: (width, height)
+    K                    : (3,3) intrinsic matrix
+    dist                 : (1,5) distortion coefficients
+    rms                  : float reprojection error
+    frame_size           : (width, height)
+    health               : optional dict from calibrator._calibration_health()
+    quality_distribution : optional dict from QualityTracker.as_dict() —
+                           the per-axis bin histograms, fill fractions,
+                           coverage, entropy and diversity history. Stored
+                           verbatim so a post-mortem run can analyse why
+                           a calibration came out the way it did.
+    confidence           : optional dict from confidence.compute_confidence()
+                           — overall score, grade, sub-scores, heuristic fx
+                           uncertainty, and worst-factor breakdown.
     """
     data = {
         "camera_intrinsics": {
@@ -49,6 +67,36 @@ def export_intrinsics_json(output_path, K, dist, rms, frame_size):
             "height": frame_size[1],
         },
     }
+
+    if health is not None:
+        # Persist the same diagnostic block the calibrator prints to stdout.
+        # `passed` is a top-level boolean so consumers can gate on it.
+        data["calibration_health"] = {
+            "passed": len(health.get("warnings", [])) == 0,
+            "aspect_err_pct": float(health.get("aspect_err", 0.0)) * 100.0,
+            "principal_point_offset_x_frac": float(
+                health.get("principal_point_offset_x_frac", 0.0)
+            ),
+            "principal_point_offset_y_frac": float(
+                health.get("principal_point_offset_y_frac", 0.0)
+            ),
+            "edge_gap_frac": float(health.get("edge_gap", 0.0)),
+            "edge_gap_pct": float(health.get("edge_gap", 0.0)) * 100.0,
+            "warnings": list(health.get("warnings", [])),
+        }
+
+    if quality_distribution is not None:
+        # Per-axis bin histograms (X, Y, Size, Skew) plus diversity
+        # history. Lets you reconstruct *exactly* which quality regions
+        # were under-served on a given run, after the fact.
+        data["quality_distribution"] = quality_distribution
+
+    if confidence is not None:
+        # Overall confidence score (0-100), letter grade, sub-score
+        # breakdown, heuristic fx uncertainty estimate, and worst-factor
+        # diagnostics. Designed for downstream gating ("reject if
+        # confidence < 75").
+        data["confidence"] = confidence
 
     path = Path(output_path)
     json_path = path.with_suffix(".json")

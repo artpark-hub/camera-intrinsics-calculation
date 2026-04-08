@@ -1154,28 +1154,26 @@ The server runs on a background daemon thread. SSE uses a
 per-client queue with a maxsize of 60 messages, with automatic
 cleanup of dead clients. The MJPEG feed is capped at ~20 fps.
 
-### Known Device Database
+### Board Width in iPad Mode
 
-For iPad mode, a lookup table of known devices maps model names
-to physical screen dimensions (mm), CSS viewport sizes, and DPR.
-This allows automatic computation of the board's physical width
-from the rendered pixel width:
+In iPad mode the user supplies `--board_width_mm` directly, measured
+with a ruler from the corner of the outermost square to the corner of
+the opposite outermost square along the wider edge of the rendered
+pattern. An earlier version of this tool maintained a database of
+known iPad models and computed the displayed pattern width from each
+device's nominal CSS viewport, but this was removed: the actual
+viewport varies with fullscreen state, orientation, Display Zoom,
+Split-View, and Safari URL-bar visibility, none of which are
+reliably detectable from server-side code, and a ruler is more
+accurate than any database.
 
-```
-    Model              Screen (mm)       CSS Viewport
-    -----              -----------       ------------
-    ipad-pro-11        178.5 x 247.6    834 x 1194
-    ipad-pro-12.9      214.9 x 280.6    1024 x 1366
-    ipad-pro-13        215.5 x 281.6    1032 x 1376
-    ipad-air-10.9      174.1 x 248.1    820 x 1180
-    ipad-air-11        178.5 x 247.6    834 x 1194
-    ipad-10.2          161.2 x 215.0    810 x 1080
-    ipad-10.9          174.1 x 248.1    820 x 1180
-```
-
-The computation accounts for CSS border width (24px overlay on each
-side) and the `object-fit: contain` layout to determine the exact
-physical pattern width.
+This value is also less critical than it sounds. Camera calibration
+via Zhang's method is **scale-invariant in the object points** (see
+§8.3): if every 3D board coordinate is scaled by α, the homography
+absorbs that factor entirely into the per-view translation vector.
+The intrinsic matrix `K` and distortion coefficients are unchanged.
+So an inaccurate `--board_width_mm` only rescales the returned
+`tvecs` — fx, fy, cx, cy, k1, k2, k3, p1, p2 are unaffected.
 
 ---
 
@@ -1184,8 +1182,8 @@ physical pattern width.
 ```
     Typical usage (auto-capture mode, default):
 
-    python main.py --rtsp rtsp://192.168.1.50:554/stream \
-                   --ipad --ipad_model ipad-pro-11
+    python main.py --source rtsp://192.168.1.50:554/stream \
+                   --ipad --board_width_mm 133
 
     1. Open http://<laptop-ip>:8080/ on the iPad
     2. Tap to enter fullscreen

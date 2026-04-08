@@ -33,41 +33,51 @@ Quartz framework for screen auto-detection.
 **Auto-capture mode (recommended):**
 
 ```bash
-uv run python main.py --rtsp rtsp://192.168.0.64:5543/live/channel0 \
-    --ipad --ipad_model ipad-pro-11
+uv run python main.py --source rtsp://192.168.0.64:5543/live/channel0 \
+    --ipad --board_width_mm 133
 ```
 
 **Timed-capture mode:**
 
 ```bash
-uv run python main.py --rtsp rtsp://192.168.0.64:5543/live/channel0 \
-    --ipad --ipad_model ipad-pro-11 \
+uv run python main.py --source rtsp://192.168.0.64:5543/live/channel0 \
+    --ipad --board_width_mm 133 \
     --capture_mode timed --capture_interval 3
 ```
 
 **Stable mode (legacy — requires holding iPad still):**
 
 ```bash
-uv run python main.py --rtsp rtsp://192.168.0.64:5543/live/channel0 \
-    --ipad --ipad_model ipad-pro-11 \
+uv run python main.py --source rtsp://192.168.0.64:5543/live/channel0 \
+    --ipad --board_width_mm 133 \
     --capture_mode stable
 ```
+
+**Via a MediaMTX republish (when the camera is on a different subnet or behind an ACL):**
+
+```bash
+uv run python main.py --source rtsp://mediamtx-host:8554/ART-65 \
+    --ipad --board_width_mm 133
+```
+
+You don't need the camera credentials in this case — MediaMTX (or any other RTSP proxy in your infrastructure) handles the upstream pull. This is the recommended approach for multi-camera deployments.
+
+> **Quoting tip:** if your URL contains `?`, `&`, or `@` (most direct RTSP URLs do), wrap it in **single quotes**. In zsh, an unquoted `?` triggers `no matches found` and an unquoted `&` puts the command in the background. Single quotes fix both.
 
 ### Common CLI options
 
 | Flag | Purpose | Default |
 |---|---|---|
-| `--rtsp URL` | RTSP stream URL of the camera to calibrate | — |
-| `--ipad` | Enable two-device iPad mode | off |
-| `--ipad_model MODEL` | iPad model for auto board-width (implies `--ipad`) | — |
+| `--source URL` | Stream URL — RTSP, HLS (`.m3u8`), HTTP-MJPEG, or a MediaMTX republish. `--rtsp` is accepted as an alias. | — |
+| `--ipad` | Enable two-device iPad mode (serves the pattern over HTTP at port `--port`) | off |
 | `--capture_mode MODE` | `auto`, `timed`, or `stable` | `auto` |
 | `--capture_interval N` | Seconds between captures in timed mode | `2.0` |
-| `--board_width_mm N` | Manual board physical width (mm) if model not listed | auto |
+| `--board_width_mm N` | Physical width (mm) of the displayed pattern, measured with a ruler from corner-to-corner of the outermost squares. Required for iPad mode. Auto-detected on macOS for local-screen mode. | auto / required |
 | `--min_captures N` | Minimum poses to collect | `20` |
 | `--diversity_threshold N` | Diversity score needed to complete (0-1) | `0.35` |
 | `--port N` | Web server port | `8080` |
 | `--no_voice` | Disable voice guidance | off |
-| `--list_devices` | Print all known iPad/tablet models and exit | — |
+| `--proc_height N` | Optional internal downscale (height in pixels). **Leave at 0** for accurate calibration — any positive value means the resulting intrinsics describe the resized frame, not the camera, AND sub-pixel corner localization is degraded. Only use if CPU-bound. | `0` (native) |
 
 See `python main.py --help` for the full list.
 
@@ -198,18 +208,126 @@ Then after computation:
 
 ---
 
+## Getting Accurate Results — Read This First
+
+Camera intrinsic calibration is **physics-limited**, not software-limited.
+Whether the resulting numbers are correct depends almost entirely on what you
+showed the camera, not on the solver. The two failure modes that produce
+"looks great, RMS 0.07" results that are silently wrong are:
+
+1. **The pattern never reaches the corners of the image.** Lens distortion
+   `(k1, k2, k3)` is, by definition, zero at the principal point and grows
+   with the radial distance from it. If your iPad only ever appears in the
+   inner ~60% of the frame, the solver has no observations at large radii
+   and is free to invent any distortion model that fits the noise in the
+   centre. The result is a low RMS but a totally wrong distortion estimate.
+
+2. **The pattern is too small relative to the sensor.** A 16 cm wide iPad in
+   front of a 2560 × 1440 camera at 2 m only covers a small fraction of the
+   frame. You can't get the *corners of the iPad* to the *corners of the
+   image* without either getting close, or using a much larger pattern.
+
+The fixes are mechanical, not algorithmic:
+
+### Pre-flight checklist
+
+| ✓ | Check |
+|---|---|
+| ☐ | **Use the camera's native resolution.** Do not pass `--proc_height`. The intrinsics MUST describe the resolution you'll actually use the camera at. If your camera delivers 2560×1440, calibrate at 2560×1440. The startup banner now prints "Source frame size" and "Processing at native resolution" — confirm both. |
+| ☐ | **Use the largest pattern you have.** iPad Pro 12.9" > iPad Pro 11" > iPad mini. Better still, print an A2 ChArUco board for the very first calibration of a new camera (see two-stage workflow below). |
+| ☐ | **Get close enough that the iPad fills at least half the frame.** For an iPad Pro 11" (≈16 cm wide) on a 65° FOV camera, that's roughly **40-60 cm from the lens** — much closer than people instinctively hold it. |
+| ☐ | **Push the pattern to all four corners and edges of the image.** Not the centre. The corners. The HUD now reports an "edge-gap" health metric — aim for it to be under 10%. |
+| ☐ | **Tilt aggressively.** Lean the iPad forward, back, left, right at every position. Without tilt, focal length is degenerate with object-distance. |
+| ☐ | **Read the health check at the end.** The calibrator now prints a `CALIBRATION HEALTH CHECK` block with warnings. If you see any of: `|k1| > 1.5`, `|k3| > 1`, `RMS < 0.10`, `edge-gap > 15%`, or `fx ≠ fy by > 1%` — the calibration is wrong, regardless of how low the RMS looks. Recapture. |
+
+### What does (and does not) depend on `board_width_mm`
+
+A common worry: *"what if my iPad's board width is wrong by 10% — are my fx/fy off by 10%?"*
+
+**No.** Camera intrinsic calibration via Zhang's method is *scale-invariant in
+the object points*. If you scale every 3D board coordinate by a factor α, the
+homography between the board plane and the image plane absorbs that factor
+entirely into the camera's translation vector. The resulting **K matrix and
+distortion coefficients are unchanged**.
+
+What `board_width_mm` *does* affect:
+
+- The absolute scale of `tvecs` returned by the calibrator and any downstream
+  PnP distance you derive from it.
+- Nothing else. `(fx, fy, cx, cy, k1, k2, k3, p1, p2)` are determined entirely
+  by image-plane geometry — not by what you told the solver about how big the
+  board was in millimetres.
+
+So **if you only care about intrinsics**, an inaccurate `--board_width_mm` is
+harmless. If you care about real-world pose distances (e.g., "how far is that
+person from the camera?"), measure the rendered pattern on the iPad with a
+ruler (corner of outermost square to corner of outermost square) and pass the
+measured value via `--board_width_mm`.
+
+There used to be an `--ipad_model` flag with a database of known iPad
+viewports for auto-computing this value, but it was removed because a ruler
+is more reliable than any database — fullscreen state, orientation, Display
+Zoom, Split-View, and the URL bar all change the effective viewport, and
+none of them are reliably detectable from outside Safari. Just measure.
+
+### Two-stage workflow (recommended for production)
+
+A small mobile target genuinely cannot constrain distortion well on a
+high-resolution sensor. The honest answer is to split the problem:
+
+**Stage 1 — Distortion (one-time, by an installer):**
+Calibrate the camera once with a printed **A2 or A1 chessboard / ChArUco
+board** brought right up to the lens so it fills the frame and tilts into
+every corner. Save the resulting `(k1, k2, k3, p1, p2)` as a per-camera
+factory file. This is the calibration the chess-board reference you compared
+against was doing.
+
+**Stage 2 — Refresh focal/principal (in the field, with the iPad):**
+Use the iPad workflow only to refresh `(fx, fy, cx, cy)` after focus drift
+or thermal cycling, with the distortion coefficients held fixed at their
+factory values. This works because focal length and principal point can be
+estimated from a small central target — only distortion needs the corners.
+
+Support for fixing distortion to factory values is on the roadmap; for now,
+if you need accurate distortion you must do Stage 1 with a large rigid
+target.
+
+### What "good" looks like
+
+A healthy calibration on a typical 1080p/1440p IP camera should show:
+
+- **fx ≈ fy** within 0.5%
+- **cx, cy** within ~5% of the image centre
+- **|k1|** roughly 0.1 – 0.6 (mild barrel for wide lenses, mild pincushion for tele)
+- **|k2|** under 0.5
+- **k3 ≡ 0** (held fixed by default)
+- **|p1|, |p2|** under 0.005
+- **RMS** between **0.20 and 0.50 px**. Below 0.10 px is a red flag for overfitting.
+- **Edge-gap** under 10% (corners reach within 10% of every image edge).
+
+---
+
 ## The Ideal Routine (Auto Mode)
 
-Think of it as **a slow sweep covering positions, distances, and angles**:
+Think of it as **a slow sweep covering positions, distances, angles, AND
+the four corners of the camera image**:
 
-1. **Start close** (~1 m) — sweep the iPad left to right across the camera view
-2. **Step back** (~2 m) — sweep again, varying height (hold high, then low)
-3. **Step back more** (~3 m) — sweep again
-4. **Throughout** — occasionally tilt the iPad (lean it forward, back, left, right)
+1. **Start close** (~40-60 cm) — sweep the iPad to **each of the four corners**
+   of the camera view. Hold it at the corner long enough for one capture, then
+   move to the next corner. This is the single most important phase — it
+   gives the solver its only observations at large radial distances.
+2. **Step back** (~1.5 m) — sweep left-to-right across the frame, varying
+   height (hold high, then low).
+3. **Step back more** (~3 m) — sweep again.
+4. **Throughout** — tilt the iPad: forward, back, left, right. The "Skew"
+   bar should always be filling.
 
-The system captures automatically as you cover new regions. The voice guidance
-tells you what's still needed. A typical calibration takes **2-3 minutes** and
-**20 captures**.
+The system captures automatically as you cover new regions. The voice
+guidance tells you what's still needed. A typical calibration takes
+**2-3 minutes** and **20-30 captures**.
+
+When the run finishes, **read the health check block**. If it prints
+warnings, recapture rather than trusting the numbers.
 
 ---
 
@@ -279,22 +397,27 @@ corrected = cv2.undistort(frame, K, dist)
 
 ---
 
-## Known iPad Models
+## Measuring `--board_width_mm`
 
-Run `uv run python main.py --list_devices` to see all supported models:
+The application no longer keeps a database of iPad models — that approach
+needed to know the exact CSS viewport, fullscreen state, orientation,
+Split-View status, and zoom level of every device, and got most of them
+subtly wrong. **A ruler is more reliable than any model database.**
 
-```
-  ipad-pro-11             iPad Pro 11" (1st / 2nd / 3rd / 4th gen)
-  ipad-pro-12.9           iPad Pro 12.9" (3rd / 4th / 5th / 6th gen)
-  ipad-pro-13             iPad Pro 13" M4 (2024)
-  ipad-air-10.9           iPad Air 10.9" (4th / 5th gen)
-  ipad-air-11             iPad Air 11" M2 (2024)
-  ipad-10.2               iPad 10.2" (7th-9th gen)
-  ipad-10.9               iPad 10.9" (10th gen, 2022)
-```
+Once the iPad is showing the ChArUco pattern (in fullscreen):
 
-If your device is not listed, measure the physical width of the displayed
-pattern area on the iPad screen and pass it via `--board_width_mm`.
+1. Hold a ruler (mm side) against the iPad screen.
+2. Measure from the **corner of the outermost square** on one side to the
+   **corner of the outermost square** on the opposite side, along the
+   **wider** edge of the rendered board (i.e., 5 squares wide for the
+   default 5×7 board).
+3. Pass that value as `--board_width_mm`.
+
+That measurement only affects the absolute scale of returned `tvecs` —
+Zhang's method is scale-invariant in object points, so `(fx, fy, cx, cy,
+k1, k2, k3, p1, p2)` are determined entirely by image-plane geometry. If
+you only care about intrinsics you can skip the measurement; the
+calibration will still produce a correct `K` matrix.
 
 ---
 
@@ -304,12 +427,18 @@ pattern area on the iPad screen and pass it via `--board_width_mm`.
 |---|---|
 | iPad border stays red | Ensure the iPad screen is facing the camera and is within its field of view |
 | RTSP stream timeout | Check the camera URL and network connectivity; retry the command |
+| RTSP "Connection refused" but the camera works in another app | You're probably on a different subnet than the camera and port 554 is blocked by a firewall/ACL. Point `--source` at a MediaMTX (or other media-server) republish instead — e.g. `--source rtsp://<mediamtx-host>:8554/<camera-name>`. HLS URLs (`http(s)://…/index.m3u8`) also work but add 1-3 s of latency which can hurt auto-capture. |
 | "No TTS engine found" | Install `espeak` (Linux) or use `--no_voice`; visual feedback still works |
 | Quality bars stuck | Follow the voice guidance — change distance, tilt, or position |
 | Captures not happening (auto mode) | Move more — the system waits for the board to enter a *new* quality region |
 | Captures not happening (stable mode) | Hold the iPad still for ~1 second; reduce hand shake |
 | Calibration completes too early | Increase `--diversity_threshold` (e.g., 0.50) or `--min_captures` |
 | Calibration never completes | Decrease `--diversity_threshold` (e.g., 0.25) — or press `q` to quit with current samples |
+| Health check warns "RMS suspiciously LOW" | Overfitting. The captures cluster in a small region of the frame. Recapture with the iPad pushed to **all four image corners** at close range. |
+| Health check warns "edge-gap > 15%" | Your captures never reach the image edges, so distortion (k1, k2) is unconstrained. Get the iPad closer and physically sweep it through each of the four corners of the camera view. |
+| Health check warns "\|k1\| > 1.5" or "\|k3\| > 1" | The distortion model is fitting noise. Same fix as above — push to image corners. k3 is fixed at 0 by default; if you see it nonzero you've passed `fix_k3=False`. |
+| Health check warns "fx ≠ fy by > 1%" | Underconstrained solve. fix_aspect_ratio is on by default; if you see this you've turned it off. Re-enable it. |
+| Intrinsics from this run don't match a previous chessboard calibration | First check: was the previous calibration done at the same resolution? Run `--proc_height 0` (default) and confirm the startup banner says "Source frame size : 2560x1440 / Processing at native resolution". A 1280×720 calibration is **not** comparable to a 2560×1440 calibration without scaling. |
 
 ---
 
@@ -321,5 +450,5 @@ pattern area on the iPad screen and pass it via `--board_width_mm`.
 | Linux | `espeak` / `spd-say` / `festival` | No | Yes |
 | Windows | PowerShell SAPI | No | Yes |
 
-On all platforms, use `--board_width_mm` or `--ipad_model` for accurate
-physical board dimensions.
+On all platforms, use `--board_width_mm <measured>` for accurate physical
+board dimensions in iPad mode.

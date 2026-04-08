@@ -135,6 +135,42 @@ class CharucoDetector:
         """Clear the stability history after a capture."""
         self.corner_history.clear()
 
+    def is_momentarily_stable(self, corners,
+                              window: int = 3,
+                              threshold: float = 15.0) -> bool:
+        """
+        Lightweight "is the board roughly still *right now*" check for
+        auto-mode lock gating.
+
+        Unlike `check_stability`, which looks at `self.stability_frames`
+        of history (~1 s at 30 fps) and expects near-zero variance, this
+        check looks at only the most recent `window` frames (~150 ms)
+        and allows a larger pixel variance. The intent is different:
+          - `check_stability`  -> "board is rock-solid, safe to capture"
+          - `is_momentarily_stable` -> "user has briefly paused, it is
+            fair to say 'Hold still' and start the lock countdown"
+
+        Returns False while the user is actively walking or sweeping,
+        True once they pause — even briefly. This is what prevents the
+        "Hold still" prompt from firing while the user is still moving
+        THROUGH a useful region on the way to somewhere else.
+        """
+        if corners is None:
+            self.corner_history.clear()
+            return False
+
+        self.corner_history.append(corners.copy())
+
+        if len(self.corner_history) < window:
+            return False
+
+        recent = list(self.corner_history)[-window:]
+        positions = np.array([
+            c.reshape(-1, 2).mean(axis=0) for c in recent
+        ])
+        variance = float(np.var(positions, axis=0).sum())
+        return variance < threshold
+
     @staticmethod
     def board_sharpness(frame, corners):
         """

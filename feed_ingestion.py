@@ -2,7 +2,14 @@
 Remote Feed Ingestion
 =====================
 Threaded frame grabber for RTSP streams, local video files, and webcams.
-Resizes frames to a workable resolution for lower-latency detection.
+
+By default the native source resolution is preserved end-to-end so that
+the calibration intrinsics describe the *real* camera. Optional resizing
+is opt-in via the `target_h` argument to `resize_frame` (or the
+`--proc_height` CLI flag in `main.py`). Downscaling before detection
+discards high-frequency information needed for accurate sub-pixel corner
+localization AND produces intrinsics that only describe the resized
+frame -- both of which silently corrupt calibration accuracy.
 """
 
 import cv2
@@ -12,7 +19,7 @@ import time
 from pathlib import Path
 
 
-TARGET_HEIGHT = 720   # Resize incoming frames to this height
+TARGET_HEIGHT = 0   # 0 = no resize; preserve native source resolution
 
 
 class ThreadedCapture:
@@ -109,7 +116,18 @@ def open_source(rtsp=None, video=None, camera=None):
 
 
 def resize_frame(frame, target_h=TARGET_HEIGHT):
-    """Resize frame to target height, preserving aspect ratio."""
+    """
+    Resize frame to target height, preserving aspect ratio.
+
+    target_h <= 0 (default) returns the frame unchanged. This is the
+    correct behaviour for calibration: the resulting intrinsics must
+    describe the resolution at which the camera will be USED. Only
+    pass an explicit target_h if you know what you are doing -- e.g.
+    you are running on a low-power machine and accept a less accurate
+    calibration in exchange for higher detection FPS.
+    """
+    if target_h is None or target_h <= 0:
+        return frame
     h, w = frame.shape[:2]
     if h <= target_h:
         return frame

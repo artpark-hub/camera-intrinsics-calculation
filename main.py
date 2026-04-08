@@ -14,12 +14,12 @@ the local network.  The iPad shows real-time coloured-border feedback
 so the user knows whether the camera can see the board — without
 having to look at the laptop.
 
-    python main.py --rtsp rtsp://… --ipad --ipad_model ipad-pro-11
-    python main.py --rtsp rtsp://… --ipad --board_width_mm 165
+    python main.py --source rtsp://… --ipad --board_width_mm 133
 
 Single-screen mode  (original)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    python main.py --rtsp rtsp://…
+    python main.py --source rtsp://…
+    python main.py --source http://mediamtx-host:8888/ART-65/index.m3u8
     python main.py --video test_video.mp4
     python main.py --camera 0
 """
@@ -27,6 +27,7 @@ Single-screen mode  (original)
 import argparse
 import cv2
 import numpy as np
+import signal
 import sys
 import time
 from collections import deque
@@ -46,9 +47,6 @@ from overlay import draw_hud
 from screen_measure import (
     auto_detect_board_width,
     print_screen_info,
-    compute_device_board_width,
-    list_known_devices,
-    KNOWN_DEVICES,
 )
 from exporter import (
     export_intrinsics_json,
@@ -56,6 +54,36 @@ from exporter import (
     save_verification_image,
     print_results,
 )
+from confidence import compute_confidence, print_confidence_summary
+
+
+# ── Live (in-loop) calibration confidence check ─────────────────────────────
+
+def run_trial_confidence(all_corners, all_ids, board, frame_size, tracker,
+                         outlier_rms):
+    """
+    Run a silent trial calibration on the captures collected so far and
+    return the computed confidence dict, plus the live fx for HUD display.
+
+    Returns (confidence_dict, rms, fx) on success, or (None, None, None)
+    if the solver failed (typically: too few valid obj/img point pairs).
+    """
+    try:
+        rms, K, dist, _rvecs, _tvecs, _uc, _uid, health = calibrate_charuco(
+            all_corners, all_ids, board, frame_size,
+            outlier_rms=outlier_rms,
+            quiet=True,
+        )
+    except Exception as e:
+        return (None, None, None, str(e))
+
+    conf = compute_confidence(
+        rms=rms, K=K, dist=dist,
+        health=health,
+        tracker_dict=tracker.as_dict(),
+        per_frame_errors=None,
+    )
+    return (conf, float(rms), float(K[0, 0]), None)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -67,23 +95,34 @@ def parse_args():
         epilog=(
             "examples:\n"
             "  # iPad auto-capture (recommended — just wave the iPad slowly)\n"
-            "  python main.py --rtsp rtsp://… --ipad --ipad_model ipad-pro-11\n\n"
+            "  python main.py --source rtsp://… --ipad --board_width_mm 133\n\n"
+            "  # Via a MediaMTX republish (when the camera is on a different subnet)\n"
+            "  python main.py --source rtsp://mediamtx-host:8554/ART-65 "
+            "--ipad --board_width_mm 133\n\n"
+            "  # Via HLS playlist (works through firewalls; adds 1-3 s latency)\n"
+            "  python main.py --source http://mediamtx-host:8888/ART-65/index.m3u8 "
+            "--ipad --board_width_mm 133\n\n"
             "  # Timed capture — one capture every 3 seconds\n"
-            "  python main.py --rtsp rtsp://… --ipad --ipad_model ipad-pro-11 "
+            "  python main.py --source rtsp://… --ipad --board_width_mm 133 "
             "--capture_mode timed --capture_interval 3\n\n"
             "  # Legacy stable mode (requires holding iPad still)\n"
-            "  python main.py --rtsp rtsp://… --ipad --ipad_model ipad-pro-11 "
+            "  python main.py --source rtsp://… --ipad --board_width_mm 133 "
             "--capture_mode stable\n\n"
-            "  # Local-screen mode\n"
-            "  python main.py --rtsp rtsp://… --board_width_mm 280\n\n"
-            "  # List known iPad models\n"
-            "  python main.py --list_devices\n"
+            "  # Local-screen mode (pattern on Mac, board width auto-detected)\n"
+            "  python main.py --source rtsp://… --board_width_mm 280\n"
         ),
     )
 
     # Input source (mutually exclusive)
-    src = parser.add_mutually_exclusive_group(required="--list_devices" not in sys.argv)
-    src.add_argument("--rtsp",   type=str, help="RTSP stream URL")
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument(
+        "--source", "--rtsp", dest="source", type=str,
+        metavar="URL",
+        help="Stream URL — anything FFmpeg can open: "
+             "rtsp://…, http(s)://…/index.m3u8 (HLS), http://…/stream (MJPEG), "
+             "or a MediaMTX republish like rtsp://mediamtx-host:8554/<name>. "
+             "(`--rtsp` is kept as a backwards-compatible alias.)",
+    )
     src.add_argument("--video",  type=str, help="Path to a local video file")
     src.add_argument("--camera", type=int, help="Webcam device index")
 
@@ -91,28 +130,25 @@ def parse_args():
     parser.add_argument(
         "--ipad", action="store_true",
         help="Serve the ChArUco pattern to an iPad/tablet via web "
-             "(enables two-device mode with visual feedback)",
-    )
-    parser.add_argument(
-        "--ipad_model", type=str, default=None,
-        metavar="MODEL",
-        help="Known iPad/tablet model for auto board-width computation "
-             "(e.g. ipad-pro-11).  Use --list_devices to see options.",
+             "(enables two-device mode with visual feedback). Open "
+             "http://<your-laptop-ip>:8080/ on the iPad in Safari.",
     )
     parser.add_argument(
         "--port", type=int, default=8080,
         help="Web-server port for iPad mode (default: 8080)",
     )
-    parser.add_argument(
-        "--list_devices", action="store_true",
-        help="Print known iPad/tablet models and exit",
-    )
 
     # Board display
     parser.add_argument(
         "--board_width_mm", type=float, default=0,
-        help="Physical width of the displayed board pattern (mm). "
-             "Auto-detected from --ipad_model or Mac screen if omitted.",
+        help="Physical width (mm) of the displayed ChArUco pattern, measured "
+             "with a ruler from the corner of the outermost square to the "
+             "corner of the opposite outermost square. Required for iPad "
+             "mode. In local-screen mode on macOS it will be auto-detected "
+             "from Quartz if not specified. NOTE: Zhang's method is "
+             "scale-invariant in object points, so this value affects only "
+             "the absolute scale of returned tvecs — never fx, fy, cx, cy "
+             "or the distortion coefficients.",
     )
     parser.add_argument(
         "--display_width", type=int, default=0,
@@ -122,16 +158,44 @@ def parse_args():
 
     # Calibration parameters
     parser.add_argument("--min_captures", type=int, default=20,
-                        help="Minimum number of pose captures (default: 20)")
+                        help="Minimum number of pose captures (default: 25)")
     parser.add_argument("--bins", type=int, default=5,
                         help="Number of bins per quality axis (default: 5)")
     parser.add_argument("--min_per_bin", type=int, default=2,
                         help="Samples required per bin (default: 2)")
     parser.add_argument("--outlier_rms", type=float, default=0.5,
                         help="Per-frame RMS threshold for outlier rejection (default: 0.5)")
-    parser.add_argument("--diversity_threshold", type=float, default=0.35,
-                        help="Diversity score (0-1) needed for completion (default: 0.35). "
+    parser.add_argument("--diversity_threshold", type=float, default=0.75,
+                        help="Diversity score (0-1) needed for completion (default: 0.75). "
                              "Lower = easier to finish, higher = more coverage required.")
+    parser.add_argument("--confidence_threshold", type=float, default=85.0,
+                        help="Minimum confidence score (0-100) required to finish "
+                             "(default: 85 = 'Good' / B grade). The capture loop runs "
+                             "trial calibrations past --min_captures and only exits once "
+                             "confidence clears this threshold (or --max_captures is hit). "
+                             "Handheld iPad calibration is structurally capped around 91 "
+                             "because the edge_gap floor is physical (bezel + marker quiet "
+                             "zone), so 95+ is essentially unreachable without a printed "
+                             "board on a flat desk.")
+    parser.add_argument("--min_axis_coverage", type=float, default=0.80,
+                        help="Minimum fraction of bins that must be touched on EVERY axis "
+                             "before completion is allowed (default: 0.80).")
+    parser.add_argument("--max_captures", type=int, default=80,
+                        help="Hard cap on number of captures (default: 80). Safety net so "
+                             "an aggressive --confidence_threshold can't trap the user in "
+                             "an infinite capture loop.")
+    parser.add_argument("--trial_calibration_every", type=int, default=3,
+                        help="Run a trial calibration every N captures past --min_captures "
+                             "to check confidence (default: 3). Smaller = more responsive "
+                             "but more CPU.")
+    parser.add_argument("--user_facing_camera",
+                        type=lambda v: v.lower() not in ("false", "0", "no", "off"),
+                        default=True,
+                        help="Whether the user is standing FACING the camera (default: true). "
+                             "When true, the camera image is mirrored relative to the user's "
+                             "body, so voice prompts flip 'left' and 'right' to match what "
+                             "the user's body should actually do. Pass --user_facing_camera "
+                             "false for selfie-style or moving-with-camera setups.")
 
     # Capture mode
     parser.add_argument(
@@ -165,6 +229,17 @@ def parse_args():
     parser.add_argument("--no_board", action="store_true",
                         help="Don't display ChArUco board (use external pattern)")
 
+    # Performance / processing
+    parser.add_argument(
+        "--proc_height", type=int, default=0,
+        help="Optional: downscale frames to this height before detection. "
+             "0 (default) = preserve native source resolution. "
+             "WARNING: any value > 0 means the resulting intrinsics describe "
+             "the *resized* frame, not the camera, and sub-pixel corner "
+             "localization is degraded. Only use this if you are CPU-bound "
+             "and accept reduced accuracy.",
+    )
+
     return parser.parse_args()
 
 
@@ -173,13 +248,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # ── --list_devices shortcut ──────────────────────────────────────────────
-    if args.list_devices:
-        list_known_devices()
-        return
-
     # ── Defaults that depend on mode ─────────────────────────────────────────
-    ipad_mode = args.ipad or args.ipad_model is not None
+    ipad_mode = args.ipad
     if args.display_width == 0:
         args.display_width = 1200 if ipad_mode else 900
 
@@ -225,43 +295,51 @@ def main():
 
     # ── 3. Determine physical board width ────────────────────────────────────
     if args.board_width_mm > 0:
-        print(f"[INFO] Physical board width: {args.board_width_mm} mm (user-specified)")
-    elif args.ipad_model:
-        try:
-            args.board_width_mm = compute_device_board_width(
-                args.ipad_model, args.display_width
-            )
-            dev = KNOWN_DEVICES[args.ipad_model]
-            print(f"[INFO] iPad model: {dev['name']}")
-            print(f"[INFO] Physical board width: {args.board_width_mm:.1f} mm "
-                  f"(auto-computed for {args.ipad_model}, portrait)")
-        except (ValueError, KeyError) as e:
-            print(f"[ERROR] {e}")
-            list_known_devices()
-            sys.exit(1)
+        print(f"[INFO] Physical board width: {args.board_width_mm:.1f} mm "
+              f"(user-specified)")
     elif not ipad_mode:
-        # Try macOS auto-detection (only useful when pattern is on local screen)
+        # Single-screen mode on macOS — try Quartz auto-detection
         print_screen_info()
         board_img = render_board_image(board, args.display_width)
         detected_mm = auto_detect_board_width(args.display_width, board_img)
         if detected_mm:
             args.board_width_mm = detected_mm
             print(f"[INFO] Physical board width: {args.board_width_mm:.1f} mm "
-                  f"(auto-detected)")
+                  f"(auto-detected from Mac screen)")
         else:
             print("[WARN] Could not auto-detect screen dimensions.")
-            print("       Provide --board_width_mm for accurate calibration.")
+            print("       Pass --board_width_mm <measured> for accurate "
+                  "real-world distances.")
     else:
-        print("[WARN] No --board_width_mm or --ipad_model specified.")
-        print("       Provide one for accurate real-world calibration.")
-        print("       Proceeding with default board units.")
+        # iPad mode without --board_width_mm
+        print("[WARN] No --board_width_mm specified for iPad mode.")
+        print("       Measure the displayed ChArUco pattern with a ruler "
+              "(corner of outermost square to corner of opposite outermost "
+              "square) and pass via --board_width_mm.")
+        print("       NOTE: this value only affects the absolute scale of "
+              "the returned tvecs — Zhang's method is scale-invariant in")
+        print("       object points, so fx, fy, cx, cy and the distortion "
+              "coefficients are determined regardless. Calibration will")
+        print("       still proceed with default object-point units.")
 
     # ── 4. Open feed ─────────────────────────────────────────────────────────
     source_type, source, frame_size = open_source(
-        rtsp=args.rtsp, video=args.video, camera=args.camera
+        rtsp=args.source, video=args.video, camera=args.camera
     )
     frame_w, frame_h = frame_size
-    print(f"[INFO] Frame size: {frame_w}x{frame_h}")
+    print(f"[INFO] Source frame size : {frame_w}x{frame_h}")
+    if args.proc_height > 0 and args.proc_height < frame_h:
+        proc_w = int(frame_w * args.proc_height / frame_h)
+        print(f"[WARN] --proc_height={args.proc_height} → frames will be DOWNSCALED to "
+              f"{proc_w}x{args.proc_height} before detection.")
+        print(f"[WARN] The resulting intrinsics will describe the {proc_w}x{args.proc_height} "
+              f"frame, NOT the native {frame_w}x{frame_h} camera. Scale fx, fy, cx, cy by "
+              f"{frame_h/args.proc_height:.3f}× before applying to full-resolution frames, "
+              f"or (better) re-run without --proc_height.")
+        proc_h_for_calib = args.proc_height
+    else:
+        print(f"[INFO] Processing at native resolution (no downscale).")
+        proc_h_for_calib = frame_h
 
     # ── 5. Initialise modules ────────────────────────────────────────────────
     det = CharucoDetector(
@@ -270,7 +348,10 @@ def main():
         stability_threshold=args.stability_threshold,
     )
     tracker = QualityTracker(n_bins=args.bins, min_per_bin=args.min_per_bin)
-    guide = VoiceGuidance(min_captures=args.min_captures)
+    guide = VoiceGuidance(
+        min_captures=args.min_captures,
+        user_facing_camera=args.user_facing_camera,
+    )
 
     if args.no_voice:
         guide._tts = None  # disable TTS backend
@@ -297,11 +378,73 @@ def main():
     # can pick the sharpest frame when the board enters a new quality region.
     frame_buffer = deque(maxlen=15)  # ~0.5s at 30fps
 
-    print(f"\n[INFO] Calibration loop started. Collect {args.min_captures} poses.")
+    # Live-confidence gate state: every N captures past min_captures we run
+    # a silent trial calibration and check the confidence score. The loop
+    # exits only once the score clears args.confidence_threshold AND the
+    # per-axis coverage clears args.min_axis_coverage, or we hit
+    # args.max_captures (the safety cap).
+    last_trial_n = 0
+    live_confidence: float | None = None
+    live_fx: float | None = None
+    live_rms: float | None = None
+
+    # Auto-mode "lock" state. When a useful pose first appears, we speak
+    # "Hold still" and then wait LOCK_HOLD seconds before actually grabbing
+    # the sharpest frame — giving the user time to freeze. This is the
+    # only feedback the user gets since they can see neither the HUD nor
+    # the iPad border feedback during a calibration run.
+    LOCK_HOLD = 0.3   # seconds between "Hold still" and the actual capture
+    # Fallback: if `is_useful` has been continuously true for this long
+    # WITHOUT ever satisfying momentarily_stable, capture anyway. This
+    # prevents the lock from starving when the user is sweeping smoothly
+    # enough to never trip the variance gate. The "pick sharpest of last
+    # N frames" stage already protects against motion blur, so we don't
+    # actually need a hard stillness precondition here.
+    USEFUL_HOLD_FALLBACK = 1.0   # seconds
+    lock_start_time = 0.0
+    lock_announced = False
+    useful_since = 0.0
+
+    # Fires once, after we've given up on enough bins that the user almost
+    # certainly needs to physically reposition (e.g. get much closer to the
+    # camera) rather than keep sweeping from the same spot.
+    struggle_announced = False
+
+    print(f"\n[INFO] Calibration loop started. "
+          f"Target: confidence ≥ {args.confidence_threshold:.0f}/100  "
+          f"(min {args.min_captures}, max {args.max_captures} captures)")
     print(f"[INFO] Capture mode: {args.capture_mode}")
-    print(f"[INFO] Quality bins: {args.bins} bins/axis x min {args.min_per_bin} "
-          f"samples/bin")
-    print("[INFO] Press 'q' to quit, 'c' to force-capture, 'r' to reset\n")
+    print(f"[INFO] Quality bins: {args.bins} bins/axis × min {args.min_per_bin} "
+          f"samples/bin  |  min-axis-coverage gate: "
+          f"{args.min_axis_coverage:.0%}")
+    print(f"[INFO] Trial calibrations every {args.trial_calibration_every} "
+          f"captures past the minimum.")
+    print("[INFO] Press 'q' to quit (keeps current data), "
+          "'c' to force-capture, 'r' to reset\n")
+
+    # Orientation primer — must be heard before any directional prompt so
+    # the user has the right mental model of "your left" / "your right".
+    if args.user_facing_camera:
+        orientation_msg = (
+            "Important. Stand facing the camera. "
+            "When I say your left or your right, I mean your physical body, "
+            "not the camera image. The camera will see you mirrored, "
+            "but you should always move toward your own left or right hand. "
+            "Start by standing about 50 to 80 centimetres from the camera. "
+            "At that distance you can easily sweep the iPad to every edge of "
+            "the camera view without walking around the room."
+        )
+    else:
+        orientation_msg = (
+            "Important. You are moving with the camera, not facing it. "
+            "Your left and right match the camera image directly. "
+            "Begin about 50 to 80 centimetres from the scene so the board "
+            "can reach every corner of the camera view."
+        )
+    print(f"\n[INFO] {orientation_msg}\n")
+    guide._say(orientation_msg, rate=165)
+    guide.wait_for_speech(timeout=12.0)
+    guide._last_voice_time = time.time()
 
     if args.capture_mode == "auto":
         guide._say("Calibration started. Slowly wave the screen around "
@@ -326,6 +469,28 @@ def main():
     running = True
     frame_count = 0
 
+    # SIGINT / Ctrl-C: gracefully request loop exit so the collected
+    # captures still proceed into the final calibration. cv2.waitKey('q')
+    # only works when the OpenCV window has focus — which is useless when
+    # the user is standing in front of the camera (facing away from the
+    # laptop) and operating entirely by voice. Ctrl-C in the terminal is
+    # their only reliable off-switch.
+    def _handle_sigint(signum, frame_arg):
+        nonlocal running
+        if running:
+            print("\n[INFO] Ctrl-C received — finishing up and running "
+                  "calibration on collected data...")
+            running = False
+        else:
+            # Second Ctrl-C → hard abort
+            print("\n[INFO] Second Ctrl-C — aborting without calibration.")
+            sys.exit(130)
+    signal.signal(signal.SIGINT, _handle_sigint)
+    print("[INFO] Press Ctrl-C in THIS terminal to finish the run at "
+          "any time (the 'q' key only works if the preview window has "
+          "focus, which it won't if you're standing in front of the "
+          "camera). Collected data is always used.")
+
     while running:
         ret, frame = read_frame(source_type, source)
         if not ret or frame is None:
@@ -336,7 +501,7 @@ def main():
             continue
 
         frame_count += 1
-        proc_frame = resize_frame(frame)
+        proc_frame = resize_frame(frame, target_h=args.proc_height)
         ph, pw = proc_frame.shape[:2]
 
         # Detect ChArUco
@@ -371,7 +536,9 @@ def main():
 
             if args.capture_mode == "auto":
                 # Auto mode: buffer recent frames; when a useful pose
-                # appears, pick the sharpest frame from the buffer.
+                # appears, announce "Hold still", wait LOCK_HOLD seconds
+                # so the user has time to freeze, and THEN pick the
+                # sharpest frame from the now-stabilised buffer.
                 sharpness = det.board_sharpness(
                     proc_frame, detection.charuco_corners
                 )
@@ -384,16 +551,73 @@ def main():
                     sharpness,
                 ))
 
-                if can_capture and is_useful and len(frame_buffer) >= 3:
-                    # Pick the sharpest frame from the buffer
-                    best = max(frame_buffer, key=lambda r: r[5])
-                    cap_frame = best[0]
-                    cap_corners = best[1]
-                    cap_ids = best[2]
-                    cap_ncorners = best[3]
-                    metrics = best[4]
-                    do_capture = True
-                    frame_buffer.clear()
+                # Only enter the lock cycle when the board is
+                # momentarily stable. Without this, the user passes
+                # THROUGH useful regions while walking toward a new
+                # target (e.g. stepping closer) and hears "Hold still"
+                # on every transient bin they cross — which is what
+                # happened on the last run. The shallow 5-frame /
+                # 6 px-variance window returns True as soon as the
+                # user briefly pauses, but stays False during active
+                # motion like walking or sweeping.
+                momentarily_stable = det.is_momentarily_stable(
+                    detection.charuco_corners
+                )
+
+                # Track how long the user has been holding a useful pose
+                # regardless of variance — used by the fallback path below.
+                if can_capture and is_useful:
+                    if useful_since == 0.0:
+                        useful_since = now
+                else:
+                    useful_since = 0.0
+
+                # Fallback: if the user has been in a useful pose for
+                # USEFUL_HOLD_FALLBACK seconds but has never tripped the
+                # variance gate (e.g. they're sweeping smoothly), force
+                # the lock so we still capture them. The sharpest-frame
+                # buffer will discard any motion-blurred candidates.
+                useful_held_long = (
+                    useful_since > 0.0
+                    and (now - useful_since) >= USEFUL_HOLD_FALLBACK
+                )
+
+                if can_capture and is_useful and \
+                        (momentarily_stable or useful_held_long):
+                    if lock_start_time == 0.0:
+                        # First frame of a new lock: speak "Hold still"
+                        # and start the hold timer. The actual capture
+                        # happens once the hold window elapses.
+                        lock_start_time = now
+                        if not lock_announced:
+                            guide.on_lock()
+                            lock_announced = True
+                            if web_push:
+                                web_push("stable",
+                                         guide.current_instruction,
+                                         tracker.total_samples())
+                    elif (now - lock_start_time) >= LOCK_HOLD and \
+                            len(frame_buffer) >= 3:
+                        # Hold window elapsed — grab the sharpest frame
+                        # from the buffer (which now contains frames
+                        # captured while the user was holding still).
+                        best = max(frame_buffer, key=lambda r: r[5])
+                        cap_frame = best[0]
+                        cap_corners = best[1]
+                        cap_ids = best[2]
+                        cap_ncorners = best[3]
+                        metrics = best[4]
+                        do_capture = True
+                        frame_buffer.clear()
+                else:
+                    # Either the pose stopped being useful, the capture
+                    # cooldown kicked in, OR the user is still actively
+                    # moving (momentarily_stable == False). In all three
+                    # cases we drop any pending lock so the next stable
+                    # useful pose gets its own fresh "Hold still"
+                    # announcement instead of inheriting a stale one.
+                    lock_start_time = 0.0
+                    lock_announced = False
 
             elif args.capture_mode == "timed":
                 # Timed mode: capture every N seconds when board is visible.
@@ -418,9 +642,20 @@ def main():
 
                 all_corners.append(cap_corners)
                 all_ids.append(cap_ids)
-                tracker.update(metrics)
+                newly_filled = tracker.update(metrics)
+                # Positive feedback: if this capture finally landed a bin
+                # the user had been actively chasing (or one we'd given
+                # up on), announce the win before the next guidance prompt.
+                for _ax, _bi in newly_filled:
+                    guide.celebrate_bin(_ax, _bi, args.bins)
                 det.reset_stability()
                 last_capture_time = time.time()
+
+                # Clear the lock so the next useful pose gets its own
+                # "Hold still" announcement rather than re-using this one.
+                lock_start_time = 0.0
+                lock_announced = False
+                useful_since = 0.0
 
                 sector = guide.current_sector or "center"
                 orientation = guide.current_orientation or "flat"
@@ -442,11 +677,65 @@ def main():
                       f"corners={cap_ncorners}, "
                       f"diversity={d_score:.2f}]")
 
-                # Check completion (diversity-based, not rigid grid)
-                if tracker.is_good_enough(
-                    min_samples=args.min_captures,
-                    score_threshold=args.diversity_threshold,
-                ):
+                # ── Completion gate ──────────────────────────────────────
+                # Two independent exit conditions:
+                #   (A) Graduated: n ≥ min_captures, min-axis coverage is
+                #       sufficient, AND a fresh trial calibration's
+                #       confidence score ≥ args.confidence_threshold.
+                #   (B) Safety: n ≥ args.max_captures (hard cap).
+                #
+                # Trial calibrations are expensive, so we only run them
+                # every args.trial_calibration_every captures past the
+                # minimum (and always on the final capture).
+                should_try_trial = (
+                    n >= args.min_captures and
+                    (n - last_trial_n) >= args.trial_calibration_every and
+                    tracker.min_axis_coverage() >= args.min_axis_coverage
+                )
+
+                finish_run = False
+
+                if should_try_trial:
+                    last_trial_n = n
+                    print(f"  🔬 Trial calibration at n={n}...")
+                    conf, trial_rms, trial_fx, err = run_trial_confidence(
+                        all_corners, all_ids, board, (pw, ph),
+                        tracker, args.outlier_rms,
+                    )
+                    if conf is None:
+                        print(f"     (trial solver failed: {err})")
+                    else:
+                        live_confidence = conf["score"]
+                        live_rms = trial_rms
+                        live_fx = trial_fx
+                        print(f"     score={live_confidence:.1f}/100  "
+                              f"grade={conf['grade']}  "
+                              f"rms={trial_rms:.4f}  "
+                              f"fx={trial_fx:.1f}  "
+                              f"±{conf['fx_uncertainty_pct_estimate']:.2f}%")
+                        if live_confidence >= args.confidence_threshold:
+                            finish_run = True
+                        else:
+                            # Speak the largest point loss so the user knows
+                            # what to fix next.
+                            worst = conf.get("worst_factors") or []
+                            if worst:
+                                top = worst[0]["factor"].replace("_", " ")
+                                short = (
+                                    f"Confidence at {live_confidence:.0f}. "
+                                    f"Worst factor: {top}. Keep going."
+                                )
+                                guide.current_instruction = short
+                                if not args.no_voice:
+                                    guide._say(short, rate=175)
+                                    guide._last_voice_time = time.time()
+
+                if n >= args.max_captures and not finish_run:
+                    print(f"  ⚠ Hit --max_captures={args.max_captures} cap — "
+                          f"finishing with current data.")
+                    finish_run = True
+
+                if finish_run:
                     guide.on_calibration_complete()
                     if web_push:
                         web_push("complete", guide.current_instruction, n)
@@ -462,6 +751,10 @@ def main():
         else:
             # ── No detection ─────────────────────────────────────────────
             det.corner_history.clear()
+            # Board lost — drop any pending lock so the next useful
+            # pose is announced fresh.
+            lock_start_time = 0.0
+            lock_announced = False
             guide.on_no_detection()
             if web_push:
                 # Only flash the iPad red if guidance actually switched
@@ -475,18 +768,53 @@ def main():
                     web_push("detected", guide.current_instruction,
                              tracker.total_samples())
 
-        # Periodic guidance (stops once diversity is good enough)
+        # Periodic guidance: target the most-starved bin by name.
+        #
+        # We prefer the per-bin guidance over the old generic axis hints
+        # because it names the exact physical move ("hold near the right
+        # edge") instead of a vague "step sideways". If every bin is
+        # already full but the confidence gate hasn't cleared yet, we
+        # fall back to the diversity-based hint so the user still hears
+        # *something* actionable.
         now = time.time()
         if (not args.no_voice
                 and now - last_suggestion_time > suggestion_interval
-                and tracker.total_samples() > 3
-                and not tracker.is_good_enough(
-                    min_samples=args.min_captures,
-                    score_threshold=args.diversity_threshold)):
-            guide.suggest_next_pose(
-                quality_progress=tracker.progress(),
-                diversity_score=tracker.diversity_score(),
-            )
+                and tracker.total_samples() > 3):
+            starved = tracker.get_starved_bin()
+            if starved is not None:
+                ax, bin_idx, _deficit = starved
+                spoken = guide.suggest_bin(ax, bin_idx, args.bins)
+                # Only count as an "attempt" if we actually spoke the
+                # instruction — otherwise the user had no chance to act.
+                if spoken is not None:
+                    gave_up = tracker.mark_attempted(ax, bin_idx)
+                    if gave_up:
+                        # One-time acknowledgement so the user knows why
+                        # the prompts are about to change target. We wait
+                        # briefly for the current instruction to finish
+                        # speaking, then deliver axis-specific recovery
+                        # advice (not just a generic "skipping").
+                        guide.wait_for_speech(timeout=4.0)
+                        skip_msg = guide.on_give_up(ax, bin_idx, args.bins)
+                        print(f"[INFO] give-up  axis={ax} bin={bin_idx}  "
+                              f"skipped_total={len(tracker._skipped_bins)}")
+                        guide._last_voice_time = time.time()
+
+                        # Struggle detection: if we've now given up on
+                        # several bins, the user is probably stuck with
+                        # a bad room layout. Tell them once so they know
+                        # to physically reposition.
+                        if (len(tracker._skipped_bins) >= 3
+                                and not struggle_announced):
+                            guide.wait_for_speech(timeout=6.0)
+                            guide.on_struggling()
+                            struggle_announced = True
+                            guide._last_voice_time = time.time()
+            else:
+                guide.suggest_next_pose(
+                    quality_progress=tracker.progress(),
+                    diversity_score=tracker.diversity_score(),
+                )
             last_suggestion_time = now
             if web_push:
                 web_push("detected", guide.current_instruction,
@@ -535,7 +863,10 @@ def main():
             all_ids.clear()
             frame_buffer.clear()
             tracker = QualityTracker(n_bins=args.bins, min_per_bin=args.min_per_bin)
-            guide = VoiceGuidance(min_captures=args.min_captures)
+            guide = VoiceGuidance(
+                min_captures=args.min_captures,
+                user_facing_camera=args.user_facing_camera,
+            )
             if args.no_voice:
                 guide._tts = None
             det.reset_stability()
@@ -560,7 +891,7 @@ def main():
     print(f"  CALIBRATING WITH {n} SAMPLES")
     print(f"{'='*60}")
 
-    rms, K, dist, rvecs, tvecs, used_corners, used_ids = calibrate_charuco(
+    rms, K, dist, rvecs, tvecs, used_corners, used_ids, health = calibrate_charuco(
         all_corners, all_ids, board, (pw, ph), args.outlier_rms
     )
 
@@ -570,7 +901,25 @@ def main():
 
     # ── 9. Print & export results ────────────────────────────────────────────
     print_results(rms, K, dist, errors)
-    export_intrinsics_json(args.output, K, dist, rms, (pw, ph))
+
+    # Per-axis bin distribution (post-mortem) and overall confidence score.
+    quality_distribution = tracker.as_dict()
+    confidence = compute_confidence(
+        rms=rms,
+        K=K,
+        dist=dist,
+        health=health,
+        tracker_dict=quality_distribution,
+        per_frame_errors=errors,
+    )
+    print_confidence_summary(confidence)
+
+    export_intrinsics_json(
+        args.output, K, dist, rms, (pw, ph),
+        health=health,
+        quality_distribution=quality_distribution,
+        confidence=confidence,
+    )
     export_calibration_npz(args.output, K, dist, rms, (pw, ph))
     save_verification_image(args.output, sample_frame, K, dist, (pw, ph))
 

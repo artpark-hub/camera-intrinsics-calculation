@@ -10,7 +10,7 @@
 #   ./setup.sh
 #
 # After setup, run the calibration with:
-#   uv run python main.py --rtsp rtsp://... --ipad --ipad_model ipad-pro-11
+#   uv run python main.py --source rtsp://... --ipad --board_width_mm 133
 # ─────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -66,7 +66,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     info "macOS detected — installing optional Quartz dependency..."
     uv pip install 'pyobjc-framework-quartz>=12.1' 2>/dev/null && \
         ok "Quartz framework installed (enables local screen auto-detection)." || \
-        warn "Quartz install failed — not critical. Use --ipad_model or --board_width_mm instead."
+        warn "Quartz install failed — not critical. Pass --board_width_mm explicitly."
 fi
 
 # ── 4. Linux TTS check (optional) ───────────────────────────────────
@@ -99,8 +99,8 @@ echo -e "${GREEN}═════════════════════
 echo ""
 echo "  Quick start (iPad mode — recommended):"
 echo ""
-echo "    uv run python main.py --rtsp rtsp://YOUR_CAMERA_URL \\"
-echo "        --ipad --ipad_model ipad-pro-11"
+echo "    uv run python main.py --source rtsp://YOUR_CAMERA_URL \\"
+echo "        --ipad --board_width_mm <measured-mm>"
 echo ""
 echo "  Then open http://<your-ip>:8080/ on the iPad."
 echo ""

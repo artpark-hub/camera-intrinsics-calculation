@@ -8,6 +8,7 @@ calibration.json
 calibration.npz
 calibration_verification.jpg
 bkup/
+bkup-home/
 
 # IDE
 .vscode/
