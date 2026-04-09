@@ -10,6 +10,7 @@ orientations.
 """
 
 import math
+import os
 import platform
 import shutil
 import subprocess
@@ -18,6 +19,74 @@ import time
 
 import cv2
 import numpy as np
+
+
+# ── Capture-acknowledgment sound ────────────────────────────────────────────
+#
+# A very short, non-speech "ping" played the instant a sample is captured.
+# This is critical UX: the user is standing in front of the camera holding
+# a board and cannot read the console. Without an audible ack they have no
+# idea whether the script is even seeing them — every voice prompt sounds
+# the same regardless of whether the previous attempt succeeded.
+#
+# Implementation notes:
+#   - On macOS we use ``afplay`` with a built-in system sound. afplay
+#     uses the system audio mixer, NOT the TTS channel, so it does not
+#     block or get blocked by ``say`` — both can play simultaneously.
+#   - On Linux we try ``paplay`` then ``aplay`` with whatever .wav we
+#     can find under /usr/share/sounds. If nothing is available we fall
+#     back to printing the BEL character (terminal beep).
+#   - If nothing works, the function silently no-ops.
+
+def _detect_capture_ping():
+    """
+    Return a callable ``ping()`` that plays a short capture-ack sound
+    asynchronously, or a no-op if no sound system is available.
+    """
+    system = platform.system()
+
+    if system == "Darwin":
+        afplay = shutil.which("afplay")
+        # Tink is short (~150ms), distinctive, and present on every macOS.
+        # Pop and Glass are alternatives if a different feel is wanted.
+        sound = "/System/Library/Sounds/Tink.aiff"
+        if afplay and os.path.exists(sound):
+            def ping():
+                # Detached, fully async — fire-and-forget.
+                subprocess.Popen(
+                    [afplay, sound],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            return ping
+
+    if system == "Linux":
+        for player in ("paplay", "aplay"):
+            cmd = shutil.which(player)
+            if not cmd:
+                continue
+            for candidate in (
+                "/usr/share/sounds/freedesktop/stereo/message.oga",
+                "/usr/share/sounds/freedesktop/stereo/bell.oga",
+                "/usr/share/sounds/alsa/Front_Center.wav",
+            ):
+                if os.path.exists(candidate):
+                    def ping(_cmd=cmd, _snd=candidate):
+                        subprocess.Popen(
+                            [_cmd, _snd],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    return ping
+
+    # Last-resort cross-platform fallback: terminal bell. Many terminals
+    # mute it by default, but it costs nothing to try.
+    def ping():
+        try:
+            print("\a", end="", flush=True)
+        except Exception:
+            pass
+    return ping
 
 
 # ── 9-sector grid ────────────────────────────────────────────────────────────
@@ -138,6 +207,18 @@ class VoiceGuidance:
             print("[INFO] No TTS engine found — voice guidance disabled "
                   "(visual feedback still active)")
 
+        # Short non-speech "ping" played on every captured sample. Plays
+        # in parallel with TTS via a separate audio channel (afplay on
+        # macOS) so it never blocks or gets blocked by speech.
+        self._capture_ping = _detect_capture_ping()
+
+        # Per-bin progress tracking for Tier-2 quantified feedback. Maps
+        # (axis, bin_idx) -> the count this bin had the last time we
+        # spoke a suggestion for it. Used to detect whether the previous
+        # prompt actually moved the needle so we can speak "good, one
+        # more" vs "still need that, try a bigger move".
+        self._last_bin_count: dict[tuple[str, int], int] = {}
+
         # Current instruction (displayed as text on HUD and iPad)
         self.current_instruction = "Place the screen in view of the camera"
         self.current_sector: str | None = None
@@ -158,6 +239,19 @@ class VoiceGuidance:
             target=self._tts, args=(text, rate), daemon=True
         )
         self._voice_thread.start()
+
+    def play_capture_ping(self):
+        """
+        Play the short non-speech capture-acknowledgment sound. Always
+        fires — bypasses the speech cooldown entirely because it uses a
+        separate audio channel (afplay/paplay), not the TTS subprocess.
+        Safe to call on every captured sample.
+        """
+        try:
+            self._capture_ping()
+        except Exception:
+            # Audio subsystem failures must never break the capture loop.
+            pass
 
     def _can_speak(self) -> bool:
         return time.time() - self._last_voice_time > self.voice_cooldown
@@ -469,6 +563,8 @@ class VoiceGuidance:
         return "Move the iPad to a new position and orientation"
 
     def suggest_bin(self, axis: str, bin_idx: int, n_bins: int,
+                    current: int | None = None,
+                    needed: int | None = None,
                     force: bool = False) -> str | None:
         """
         Speak a targeted instruction for a specific starved bin.
@@ -476,14 +572,68 @@ class VoiceGuidance:
         axis     : "x", "y", "size" or "skew"
         bin_idx  : which bin is starved (0 = low extreme, n_bins-1 = high)
         n_bins   : total bins per axis (so we can translate idx into semantics)
+        current  : current sample count in this bin (for progress feedback).
+                   When None, we fall back to the original behaviour of just
+                   speaking the base instruction with no progress narrative.
+        needed   : how many more samples this bin still needs to fill
+                   (= min_per_bin - current). Same fall-back as above.
         force    : if True, bypass the voice cooldown (use sparingly — for
                    major transitions such as "now targeting axis_fill")
 
         Returns the spoken text, or None if cooldown blocked it.
+
+        ── Tier-2 quantified-progress logic ──────────────────────────────
+        When ``current`` and ``needed`` are supplied, the message becomes
+        progress-aware. We compare ``current`` against the count this bin
+        had the *last time* we spoke a suggestion for it, and pick one of
+        three modes:
+
+          1. **First ask** — never spoken about this bin before. Speak the
+             full instruction plus the count: "Tilt up. Need 2 more."
+          2. **Made progress** — count increased since the last prompt.
+             Acknowledge the progress and ask for the remainder:
+             "Good. One more like that please."
+          3. **No progress** — count unchanged since the last prompt.
+             Escalate the instruction to ask for a larger move:
+             "Still need that. Try a bigger move."
+
+        This addresses the user's complaint that the original prompts
+        repeated identically with zero acknowledgment of action.
         """
         if not (force or self._can_speak()):
             return None
-        msg = self._bin_instruction(axis, bin_idx, n_bins)
+
+        base = self._bin_instruction(axis, bin_idx, n_bins)
+
+        # Legacy behaviour: no count info supplied → speak the bare
+        # instruction. Keeps old call sites working unchanged.
+        if current is None or needed is None:
+            msg = base
+        else:
+            key = (axis, bin_idx)
+            prev = self._last_bin_count.get(key)
+
+            if prev is None:
+                # First ask for this bin.
+                if needed <= 1:
+                    msg = f"{base}. Need one more like this."
+                else:
+                    msg = f"{base}. Need {needed} more like this."
+            elif current > prev:
+                # Sample(s) landed in this bin since last ask. Don't
+                # repeat the (potentially long) base instruction — keep
+                # it short and rewarding.
+                if needed <= 1:
+                    msg = "Good. One more like that please."
+                else:
+                    msg = f"Good. {needed} more like that please."
+            else:
+                # No progress since last ask — escalate the wording so
+                # the user knows the previous attempt didn't register.
+                msg = f"Still need this one. {base}, with a bigger move."
+
+            self._last_bin_count[key] = current
+
         self.current_instruction = msg
         self._say(msg)
         self._last_voice_time = time.time()
@@ -552,6 +702,9 @@ class VoiceGuidance:
         self.current_instruction = msg
         self._say(msg, rate=185)
         self._last_voice_time = time.time()
+        # Bin filled — drop its progress-tracking entry so a future
+        # request for a different bin on the same axis starts fresh.
+        self._last_bin_count.pop((axis, bin_idx), None)
 
     # ── Give-up voice with axis-specific actionable advice ────────────────
 

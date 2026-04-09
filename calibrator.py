@@ -10,16 +10,29 @@ import cv2
 import numpy as np
 
 
-def _charuco_to_obj_img_points(all_corners, all_ids, board):
+def _charuco_to_obj_img_points(all_corners, all_ids, board, y_scale=1.0):
     """
     Convert per-frame ChArUco corners + ids into matched object/image
     point lists suitable for cv2.calibrateCamera.
+
+    `y_scale` rescales the board's 3-D object-point Y axis. Use this
+    for boards whose physical cells are NOT square — OpenCV's
+    CharucoBoard only supports a single isotropic `square_length` at
+    construction time, so for a 31 mm × 33 mm cell you create the
+    board with square_length=0.031 and then pass y_scale=33/31 here.
+    The X axis is untouched. y_scale=1.0 (default) is the normal
+    square-cell case.
     """
     obj_points = []
     img_points = []
     for corners, ids in zip(all_corners, all_ids):
         obj_pts, img_pts = board.matchImagePoints(corners, ids)
         if obj_pts is not None and len(obj_pts) >= 4:
+            if y_scale != 1.0:
+                # matchImagePoints returns shape (N, 1, 3) float32. The
+                # Y component lives at index 1 on the last axis.
+                obj_pts = obj_pts.copy()
+                obj_pts[..., 1] *= y_scale
             obj_points.append(obj_pts)
             img_points.append(img_pts)
     return obj_points, img_points
@@ -31,6 +44,7 @@ def calibrate_charuco(
     fix_k3=True,
     fix_aspect_ratio=True,
     quiet=False,
+    y_scale=1.0,
 ):
     """
     Two-pass ChArUco camera calibration with constrained model.
@@ -70,6 +84,15 @@ def calibrate_charuco(
 
     # When CALIB_FIX_ASPECT_RATIO is set, OpenCV needs an initial guess for K
     # with the desired aspect ratio. A reasonable seed is fx = fy = max(w, h).
+    #
+    # CRITICAL: we MUST also set CALIB_USE_INTRINSIC_GUESS, otherwise OpenCV
+    # ignores our init_K entirely and runs initIntrinsicParams2D from scratch
+    # to compute an initial K from per-frame homographies. That function
+    # asserts `matH0.size() == Size(3,3)` and crashes hard if any frame has
+    # a near-collinear corner configuration (which happens in practice when
+    # the board is viewed edge-on or only partially detected). With
+    # USE_INTRINSIC_GUESS the buggy init step is skipped entirely and our
+    # fx = fy = max(w, h) seed is used directly as the starting point.
     init_K = None
     if fix_aspect_ratio:
         fw, fh = frame_size
@@ -77,6 +100,7 @@ def calibrate_charuco(
         init_K = np.array([[f0, 0, fw / 2.0],
                            [0, f0, fh / 2.0],
                            [0, 0,     1.0  ]], dtype=np.float64)
+        flags |= cv2.CALIB_USE_INTRINSIC_GUESS
 
     n = len(all_corners)
     constraints = []
@@ -89,7 +113,7 @@ def calibrate_charuco(
         print(f"\n[INFO] Pass 1: calibrating with {n} frames{cstr} ...")
 
     obj_points, img_points = _charuco_to_obj_img_points(
-        all_corners, all_ids, board
+        all_corners, all_ids, board, y_scale=y_scale,
     )
 
     rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
@@ -102,7 +126,8 @@ def calibrate_charuco(
 
     # Per-frame errors
     frame_errors = compute_per_frame_errors_charuco(
-        all_corners, all_ids, board, rvecs, tvecs, K, dist
+        all_corners, all_ids, board, rvecs, tvecs, K, dist,
+        y_scale=y_scale,
     )
 
     # Identify outliers
@@ -124,7 +149,7 @@ def calibrate_charuco(
             if not quiet:
                 print(f"[INFO] Pass 2: recalibrating with {len(clean_corners)} frames ...")
             obj_points2, img_points2 = _charuco_to_obj_img_points(
-                clean_corners, clean_ids, board
+                clean_corners, clean_ids, board, y_scale=y_scale,
             )
             rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
                 obj_points2, img_points2, frame_size,
@@ -280,10 +305,19 @@ def _print_health(health):
     print("─" * 60)
 
 
-def compute_per_frame_errors_charuco(corners_list, ids_list, board, rvecs, tvecs, K, dist):
-    """Compute per-frame reprojection error for ChArUco calibration."""
+def compute_per_frame_errors_charuco(corners_list, ids_list, board, rvecs, tvecs, K, dist,
+                                     y_scale=1.0):
+    """
+    Compute per-frame reprojection error for ChArUco calibration.
+
+    `y_scale` must match the value passed to `calibrate_charuco()` so
+    the Y-axis rescaling for non-square cells is applied consistently
+    to both the solve and the residual computation.
+    """
     errors = []
-    obj_points_all = board.getChessboardCorners()
+    obj_points_all = board.getChessboardCorners().copy()
+    if y_scale != 1.0:
+        obj_points_all[:, 1] *= y_scale
 
     for corners, ids, rvec, tvec in zip(corners_list, ids_list, rvecs, tvecs):
         # Get the 3D object points for detected corner IDs

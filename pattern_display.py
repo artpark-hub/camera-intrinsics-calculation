@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 
 
-# ── Board parameters (from design spec) ─────────────────────────────────────
+# ── Board parameters (defaults for the original iPad 5×7 pattern) ──────────
 SQUARES_X     = 5        # columns of squares
 SQUARES_Y     = 7        # rows of squares
 MARKER_LENGTH = 0.02     # ArUco marker side  (metres)
@@ -20,15 +20,58 @@ SQUARE_LENGTH = 0.04     # chessboard square side (metres)
 ARUCO_DICT_ID = cv2.aruco.DICT_4X4_50
 
 
-def create_board():
-    """Create and return the ChArUco board object + ArUco dictionary."""
-    aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_ID)
+# Name → OpenCV constant lookup, so the CLI can accept a human-readable
+# dictionary name. Only the dictionaries plausibly used for a calibration
+# board are exposed.
+ARUCO_DICT_NAMES = {
+    "DICT_4X4_50":   cv2.aruco.DICT_4X4_50,
+    "DICT_4X4_100":  cv2.aruco.DICT_4X4_100,
+    "DICT_4X4_250":  cv2.aruco.DICT_4X4_250,
+    "DICT_4X4_1000": cv2.aruco.DICT_4X4_1000,
+    "DICT_5X5_50":   cv2.aruco.DICT_5X5_50,
+    "DICT_5X5_100":  cv2.aruco.DICT_5X5_100,
+    "DICT_5X5_250":  cv2.aruco.DICT_5X5_250,
+    "DICT_5X5_1000": cv2.aruco.DICT_5X5_1000,
+    "DICT_6X6_50":   cv2.aruco.DICT_6X6_50,
+    "DICT_6X6_100":  cv2.aruco.DICT_6X6_100,
+    "DICT_6X6_250":  cv2.aruco.DICT_6X6_250,
+    "DICT_6X6_1000": cv2.aruco.DICT_6X6_1000,
+}
+
+
+def create_board(squares_x: int = SQUARES_X,
+                 squares_y: int = SQUARES_Y,
+                 square_length: float = SQUARE_LENGTH,
+                 marker_length: float = MARKER_LENGTH,
+                 aruco_dict_id: int = ARUCO_DICT_ID,
+                 legacy_pattern: bool = False):
+    """
+    Create and return (ChArUco board, ArUco dictionary).
+
+    For non-square physical cells (e.g. a printed A3 board with
+    31 mm wide × 33 mm tall cells), pass `square_length` equal to the
+    **X** dimension here and then supply `y_scale = length_y / length_x`
+    to `calibrate_charuco()` so the solver uses the correct 3-D object
+    points in Y. OpenCV's CharucoBoard only supports a single isotropic
+    square length at construction time, so this two-step approach is
+    how we handle rectangular cells without monkey-patching the board.
+
+    `legacy_pattern=True` switches the board to OpenCV's pre-4.6
+    marker-ID-to-position convention. Many third-party PDF generators
+    (calib.io, chev.me, older Python scripts) still use that layout.
+    Symptom of a mismatch: detectMarkers finds every marker cleanly
+    but CharucoDetector.detectBoard returns zero interior corners,
+    because OpenCV's post-4.6 default expects a different id ordering.
+    """
+    aruco_dict = cv2.aruco.getPredefinedDictionary(aruco_dict_id)
     board = cv2.aruco.CharucoBoard(
-        (SQUARES_X, SQUARES_Y),
-        SQUARE_LENGTH,
-        MARKER_LENGTH,
+        (squares_x, squares_y),
+        square_length,
+        marker_length,
         aruco_dict,
     )
+    if legacy_pattern:
+        board.setLegacyPattern(True)
     return board, aruco_dict
 
 
@@ -37,8 +80,15 @@ def render_board_image(board, pixel_width=800, margin=30):
     Render the board to a BGR image of the given pixel width.
 
     margin : white-space margin around the board (pixels).
+
+    The aspect ratio is read from the board object itself (rather than
+    the module-level SQUARES_X/Y constants) so that rendering is
+    correct even when a custom board with different dimensions has
+    been created via `create_board(squares_x=…, squares_y=…)`.
     """
-    aspect = SQUARES_Y / SQUARES_X
+    size = board.getChessboardSize()   # (cols, rows)
+    cols, rows = int(size[0]), int(size[1])
+    aspect = rows / cols
     pixel_height = int(pixel_width * aspect)
     img = board.generateImage(
         (pixel_width, pixel_height), marginSize=margin, borderBits=1
