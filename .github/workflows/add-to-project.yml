@@ -1,11 +1,14 @@
-name: Add new issues to DigitalTwin project
+name: Add new issues and PRs to DigitalTwin project
 
-# Adds every newly opened issue in this repo to the org-level "DigitalTwin"
-# project board: https://github.com/orgs/artpark-hub/projects/4
+# Adds every newly opened issue and pull request in this repo to the
+# org-level "DigitalTwin" project board:
+# https://github.com/orgs/artpark-hub/projects/4
 # This replaces GitHub's built-in auto-add, which is capped on the Free plan.
 
 on:
   issues:
+    types: [opened]
+  pull_request:
     types: [opened]
 
 jobs:
